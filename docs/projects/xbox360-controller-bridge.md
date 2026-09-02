@@ -114,9 +114,70 @@ Design rules:
 
 Fine for single-player, platformers, racing, couch co-op. Measurably worse for competitive FPS and fighting games. **Use wired Ethernet on both ends** — Wi-Fi jitter is what will actually ruin this, not average latency.
 
+Only ~3–6 ms of that is ours to win — see §3 for what is reducible and what is floor.
+
 ---
 
-## 3. Risks
+## 3. Reducing latency
+
+Split the budget into what we control and what we do not. Most of the total is not ours.
+
+### 3.1 The floor we cannot move
+
+- **RF link cadence, ~4–8 ms.** Microsoft's radio decides how often a pad reports. No amount of code changes it.
+- **The game's own XInput poll: ~16.7 ms at 60 fps, ~6.9 ms at 144 fps.** Most engines poll input once per frame, so the game quantises our input to its frame cadence regardless of how fast we deliver it.
+
+Those two terms dominate. Of the ~8–15 ms the bridge adds over a direct dongle, only roughly **3–6 ms is actually ours to win**. The realistic goal is *indistinguishable from a dongle*, not *faster than a dongle* — and once we are inside one frame of a dongle, further optimisation is invisible to the player.
+
+### 3.2 Console side — the biggest single win
+
+**Never log in the hot loop.** At 115200 baud 8N1 a character costs ~87 µs, so one 40-character `printf` costs ~3.5 ms — larger than every other term we control, combined. This is the classic homebrew latency killer. Gate all logging behind a build flag, or ring-buffer it and drain it inside the keepalive tick.
+
+Beyond that:
+
+- Keep the loop tight and unconditional: `usb_do_poll()` → read pads → send changed → `network_poll()`. No sleeps, no frame sync, no video init, no allocation.
+- **Do not batch the four pads.** Emit each pad's datagram the instant its state differs; waiting to coalesce adds a full poll interval for no bandwidth benefit we need.
+- **Investigate the interrupt endpoint interval** libxenon queues for the RF module. Its OHCI stack is full-speed, so the frame floor is 1 ms; if the endpoint descriptor is queued at a 4 or 8 ms interval, dropping it to 1–2 ms is a direct win — bounded, of course, by how often the radio actually has new data.
+
+### 3.3 PC side
+
+- **Dedicated foreground thread with a blocking `ReceiveFrom`, `ThreadPriority.Highest`.** Do *not* use `async`/`await` in the receive path — thread-pool scheduling adds hundreds of microseconds and occasional whole milliseconds under load. A blocking receive on its own thread is both simpler and faster here.
+- **Zero allocation in the hot path.** `Span<byte>`, `stackalloc`, pre-allocated buffers; no LINQ, no boxing, no closures. Set `GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency`. A gen2 pause is tens of milliseconds and dwarfs everything else on this list — the fix is to never allocate, not to tune the collector.
+- **Drain to newest.** If more than one datagram is queued for a pad, decode only the highest sequence number and discard the rest. This is precisely what the sequence field is for: after any hiccup, stale frames must be dropped rather than played back, or lag accumulates instead of recovering. Keep `ReceiveBufferSize` modest so a stall cannot bank a large backlog.
+- **Process priority High** — not Realtime, which can starve the very input stack we depend on.
+- **`SubmitReport()` event-driven on change only.** Never run a fixed-rate submission loop; it adds a quantisation step we would then have to fight.
+- If anything in the loop ever sleeps or waits on a timer, call `timeBeginPeriod(1)`. Windows' default timer resolution is 15.6 ms and is per-process since Windows 10 2004. A blocking receive avoids needing this at all.
+
+### 3.4 Network and NIC
+
+Bandwidth is a non-issue — a 62-byte frame serialises in ~5 µs on the 360's 100 Mbit link. Optimise queueing and jitter, never throughput.
+
+- **Wired only.** Wi-Fi and powerline introduce jitter, and jitter is what is actually felt.
+- **Ideally a direct link:** 360 straight into a second PC NIC with static IPs, no switch. Removes contention and bufferbloat from other LAN traffic.
+- **Disable interrupt moderation / Interrupt Throttle Rate** on the PC NIC (set to off or the lowest setting). Default moderation deliberately banks packets for 50–200 µs.
+- **Disable Energy Efficient Ethernet / Green Ethernet.** On a low-rate, mostly-idle stream the link keeps entering low-power idle and paying a wake cost on every packet. The 100 ms keepalive helps hold it awake too.
+
+### 3.5 Explicitly do not do these
+
+- **No input prediction or extrapolation.** Overshoot on stick movement feels far worse than the latency it hides.
+- **No smoothing, filtering or interpolation of axis values.** Pass raw values through and let the game apply its own deadzone and response curve.
+- **No fixed-rate resampling stage** anywhere in the chain. Every such stage adds half its period to average latency.
+
+### 3.6 Measure, do not guess
+
+Track **p50, p99 and max — never the mean.** A 10 ms link with 2 ms of jitter feels better than an 8 ms link that spikes to 15 ms.
+
+- **In-band:** the console stamps the PPC timebase (`mftb()`) into each packet, the agent echoes it back, and the console computes round-trip and halves it. Measuring RTT rather than one-way sidesteps the fact that the two clock domains are unrelated.
+- **Ground truth:** 240 fps phone slow-motion of a button press through to on-screen response, with the same test on a real dongle as the control. This is the only measurement that captures every hidden term — radio, game poll and display pipeline included.
+- **Ship criterion:** within one frame of the dongle control at the same refresh rate.
+
+### 3.7 Escape hatch
+
+If measured latency is still unacceptable after all of the above, the RF-module-to-USB desolder mod removes the console, the LAN and the bridge entirely: the module attaches to PC USB and Windows' in-box XUSB driver handles it, giving dongle-identical latency. It costs a console and breaks the no-additional-hardware constraint, so it is a fallback, not a plan.
+
+---
+
+## 4. Risks
 
 | Risk | Severity | Mitigation |
 |---|---|---|
@@ -130,7 +191,7 @@ Fine for single-player, platformers, racing, couch co-op. Measurably worse for c
 
 ---
 
-## 4. Milestones
+## 5. Milestones
 
 **Spike 1 — go/no-go (≈1 day).** Build a stock libxenon hello-world `.xex`, run it, and dump `get_controller_data()` for a *wireless* pad to the XeLL serial/telnet console. If button presses show up, the project is de-risked and everything after it is ordinary engineering. If they do not, stop and reassess before writing anything else.
 
@@ -148,7 +209,7 @@ Fine for single-player, platformers, racing, couch co-op. Measurably worse for c
 
 ---
 
-## 5. Rejected alternatives
+## 6. Rejected alternatives
 
 | Option | Why not |
 |---|---|
@@ -160,7 +221,7 @@ Fine for single-player, platformers, racing, couch co-op. Measurably worse for c
 
 ---
 
-## 6. Bottom line
+## 7. Bottom line
 
 The risky-sounding parts — the proprietary radio protocol and the Windows kernel driver — are both already solved by existing open source. What we actually have to build is a UDP bridge with careful endianness handling, hotplug semantics, and an installer. **Run Spike 1 before committing further effort**; it converts the one remaining unknown into a yes or a no in about a day.
 
