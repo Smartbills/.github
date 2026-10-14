@@ -1,0 +1,6 @@
+{
+  "name": "Licenses",
+  "description": "Smartbills open-source license check: SBOM, license gate against the org policy, and third-party notices.",
+  "iconName": "octicon law",
+  "categories": ["JavaScript", "TypeScript", "C#", "Python"]
+}
