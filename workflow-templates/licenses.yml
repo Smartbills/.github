@@ -1,0 +1,20 @@
+name: Licenses
+
+# Open-source license check and third-party notices, shared across Smartbills
+# repos. Docs, policy and exceptions format: https://github.com/Smartbills/licenses
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+
+jobs:
+  licenses:
+    uses: Smartbills/licenses/.github/workflows/check.yml@v1
+    with:
+      product: ${{ github.event.repository.name }}
+      ecosystem: yarn            # yarn | dotnet | python
+      path: .                    # Yarn workspace dir, .sln / .csproj, or Python project dir
+      distribution: distributed  # server, for code that never leaves our servers
+      mode: report               # enforce, once license-exceptions.yml is clean
+    secrets: inherit
